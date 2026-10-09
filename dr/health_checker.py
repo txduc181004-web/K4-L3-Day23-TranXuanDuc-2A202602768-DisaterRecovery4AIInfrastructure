@@ -29,13 +29,62 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
+    try:
+        r = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+    except Exception as e:  # ConnectError (stop) hoặc ReadTimeout (netblock)
+        return False, type(e).__name__
+    if r.status_code == 200:
+        return True, "ready"
+    try:
+        reasons = ",".join(r.json().get("reasons", []))
+    except Exception:
+        reasons = ""
+    return False, f"http_{r.status_code}" + (f":{reasons}" if reasons else "")
+
+
+def _emit(f, **kw):
+    rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), **kw}
+    f.write(json.dumps(rec) + "\n")
+    f.flush()
+    print("HEALTH", json.dumps(rec))
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Poll theo nhịp cố định, chỉ đổi trạng thái sau `threshold` lần LIÊN TIẾP."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # Giả định ban đầu HEALTHY: region chỉ bị đánh UNHEALTHY khi đã có bằng chứng
+    # (threshold lần fail liên tiếp), không phải vì checker vừa khởi động.
+    st = {r: {"state": "HEALTHY", "fails": 0, "oks": 0} for r in URL}
+    start = time.time()
+    end = start + duration
+    with out.open("a") as f:
+        _emit(f, event="start", regions=list(URL), interval_s=interval,
+              threshold=threshold, timeout_s=timeout,
+              detect_floor_s=round(interval * threshold, 2))
+        k = 0
+        while time.time() < end:
+            for region, s in st.items():
+                ok, reason = probe(region, timeout)
+                if ok:
+                    s["oks"], s["fails"] = s["oks"] + 1, 0
+                else:
+                    s["fails"], s["oks"] = s["fails"] + 1, 0
+                # Hồi phục cũng phải đủ threshold lần OK liên tiếp -> không flap ngược.
+                if s["state"] == "HEALTHY" and s["fails"] >= threshold:
+                    to, streak = "UNHEALTHY", {"consecutive_fails": s["fails"]}
+                elif s["state"] == "UNHEALTHY" and s["oks"] >= threshold:
+                    to, streak = "HEALTHY", {"consecutive_oks": s["oks"]}
+                else:
+                    continue
+                _emit(f, event="state_change", region=region, **{"from": s["state"]}, to=to,
+                      reason=reason, interval_s=interval, threshold=threshold,
+                      timeout_s=timeout, **streak)
+                s["state"] = to
+            # Nhịp neo theo `start` (không phải sleep(interval) sau probe) -> probe bị treo
+            # tới timeout không làm trôi lịch poll, detect floor đúng bằng interval*threshold.
+            k += 1
+            time.sleep(max(0.0, start + k * interval - time.time()))
 
 
 if __name__ == "__main__":
